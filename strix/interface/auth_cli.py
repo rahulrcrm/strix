@@ -1,8 +1,14 @@
-"""`strix auth` — ChatGPT subscription sign-in (login / status / logout).
+"""`strix auth` — subscription sign-in (login / status / logout).
 
 Signing in only stores OAuth tokens (``~/.strix/subscription-auth.json``); model
-selection stays with ``STRIX_LLM``. A ``chatgpt/<model>`` STRIX_LLM runs on the
-subscription.
+selection stays with ``STRIX_LLM``. A ``chatgpt/<model>`` STRIX_LLM runs on a
+ChatGPT subscription; a ``claude/<model>`` STRIX_LLM runs on a Claude
+subscription (scaffold — see SCAFFOLD-claude-subscription.md).
+
+Each provider module (``codex``, ``claude_oauth``) exposes the same surface
+(generate_pkce, build_authorize_url, exchange_code, CALLBACK_PATH/PORT, save/
+read_record, logout, PROVIDER, an auth-error class), so the flow below is
+provider-agnostic and just dispatches on the chosen module.
 """
 
 from __future__ import annotations
@@ -21,24 +27,48 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
 
-from strix.config import codex, load_settings
+from strix.config import claude_oauth, codex, load_settings, subscription
 
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from types import ModuleType
 
 
 logger = logging.getLogger(__name__)
 
 _CALLBACK_TIMEOUT_S = 300
 
-# CLI-facing name for the login provider. Internally this is the Codex OAuth
-# flow (``codex.PROVIDER``), but users know it as ChatGPT, so that's what the
-# command and messaging say. ``codex`` is accepted as an alias.
-LOGIN_PROVIDER = "chatgpt"
-_ACCEPTED_PROVIDERS = frozenset({LOGIN_PROVIDER, codex.PROVIDER})
+# CLI-facing provider name -> provider module. Users know these as "ChatGPT" and
+# "Claude"; internally they are the codex / claude_oauth OAuth modules. The
+# internal PROVIDER slug is accepted as an alias for each.
+DEFAULT_LOGIN_PROVIDER = "chatgpt"
+_PROVIDER_BY_NAME: dict[str, ModuleType] = {
+    "chatgpt": codex,
+    codex.PROVIDER: codex,  # "codex" alias
+    "claude": claude_oauth,
+    claude_oauth.PROVIDER: claude_oauth,  # "claude" (same)
+    "anthropic": claude_oauth,
+}
 
-_USAGE = "Usage:\n  strix auth login chatgpt [--manual]\n  strix auth status\n  strix auth logout"
+# A provider's auth-error class is named per-module (CodexAuthError /
+# ClaudeAuthError); catch either as a common tuple.
+_AUTH_ERRORS = (codex.CodexAuthError, claude_oauth.ClaudeAuthError)
+
+_USAGE = (
+    "Usage:\n"
+    "  strix auth login [chatgpt|claude] [--manual]\n"
+    "  strix auth status\n"
+    "  strix auth logout [chatgpt|claude]"
+)
+
+
+def _resolve_provider(name: str) -> ModuleType | None:
+    return _PROVIDER_BY_NAME.get(name.lower())
+
+
+def _provider_label(provider: ModuleType) -> str:
+    return subscription.PROVIDER_LABELS.get(provider.PROVIDER, provider.PROVIDER)
 
 
 def run_auth(argv: list[str]) -> int:
@@ -55,7 +85,7 @@ def run_auth(argv: list[str]) -> int:
     handlers: dict[str, Callable[[], int]] = {
         "login": lambda: _login(console, rest),
         "status": lambda: _status(console),
-        "logout": lambda: _logout(console),
+        "logout": lambda: _logout(console, rest),
     }
     handler = handlers.get(subcommand)
     if handler is not None:
@@ -71,8 +101,8 @@ def _login(console: Console, argv: list[str]) -> int:
     parser.add_argument(
         "provider",
         nargs="?",
-        default=LOGIN_PROVIDER,
-        help="Model provider to sign in with (default: chatgpt).",
+        default=DEFAULT_LOGIN_PROVIDER,
+        help="Subscription to sign in with: chatgpt or claude (default: chatgpt).",
     )
     parser.add_argument(
         "--manual",
@@ -84,39 +114,46 @@ def _login(console: Console, argv: list[str]) -> int:
     except SystemExit as exc:  # argparse already printed the message
         return int(exc.code or 2)
 
-    if args.provider.lower() not in _ACCEPTED_PROVIDERS:
+    provider = _resolve_provider(args.provider)
+    if provider is None:
         console.print(
             f"[red]Unsupported provider:[/] {args.provider}. "
-            f"Only '{LOGIN_PROVIDER}' (ChatGPT subscription) is supported."
+            "Supported: 'chatgpt' (ChatGPT subscription), 'claude' (Claude subscription)."
         )
         return 2
 
-    verifier, challenge = codex.generate_pkce()
-    state = codex.create_state()
-    authorize_url = codex.build_authorize_url(challenge, state)
+    label = _provider_label(provider)
+
+    verifier, challenge = provider.generate_pkce()
+    state = provider.create_state()
+    authorize_url = provider.build_authorize_url(challenge, state)
 
     console.print()
-    console.print("[bold]Signing in with ChatGPT[/] [dim](provider: chatgpt)[/]")
+    console.print(f"[bold]Signing in with {label}[/] [dim](provider: {provider.PROVIDER})[/]")
     console.print(
-        "[dim]This uses your ChatGPT Plus/Pro plan for inference instead of a metered API key.[/]"
+        f"[dim]This uses your {label} subscription for inference instead of a "
+        "metered API key.[/]"
     )
     console.print()
 
     try:
-        record = _run_oauth_flow(console, authorize_url, verifier, state, manual=args.manual)
-    except codex.CodexAuthError as exc:
+        record = _run_oauth_flow(
+            console, provider, authorize_url, verifier, state, manual=args.manual
+        )
+    except _AUTH_ERRORS as exc:
         return _fail(console, exc)
     except KeyboardInterrupt:
         console.print("\n[yellow]Sign-in cancelled.[/]")
         return 130
 
-    codex.save_record(record)
-    _print_success(console)
+    provider.save_record(record)
+    _print_success(console, provider)
     return 0
 
 
 def _run_oauth_flow(
     console: Console,
+    provider: ModuleType,
     authorize_url: str,
     verifier: str,
     state: str,
@@ -124,7 +161,7 @@ def _run_oauth_flow(
     manual: bool,
 ) -> dict[str, Any]:
     """Drive the browser (or manual) OAuth flow and return a token record."""
-    server = None if manual else _try_start_callback_server()
+    server = None if manual else _try_start_callback_server(provider)
 
     console.print("Open this URL in your browser to authorize:")
     console.print(f"[cyan]{authorize_url}[/]")
@@ -142,8 +179,8 @@ def _run_oauth_flow(
         if result is not None:
             code, returned_state, error = result
             if error:
-                raise codex.CodexAuthError("oauth_error", error)
-            return _finish(code, returned_state, verifier, state, require_state=True)
+                raise _auth_error(provider, "oauth_error", error)
+            return _finish(provider, code, returned_state, verifier, state, require_state=True)
         console.print("[yellow]Timed out waiting for the browser. Falling back to manual paste.[/]")
 
     # Manual fallback: the user completes sign-in and pastes the redirect URL
@@ -153,12 +190,19 @@ def _run_oauth_flow(
     try:
         pasted = console.input("Paste the full redirect URL (or code#state): ").strip()
     except EOFError as exc:
-        raise codex.CodexAuthError("no_input", "no redirect URL provided") from exc
-    code, returned_state = codex.parse_redirect_input(pasted)
-    return _finish(code, returned_state, verifier, state, require_state=False)
+        raise _auth_error(provider, "no_input", "no redirect URL provided") from exc
+    code, returned_state = provider.parse_redirect_input(pasted)
+    return _finish(provider, code, returned_state, verifier, state, require_state=False)
+
+
+def _auth_error(provider: ModuleType, code: str, message: str) -> Exception:
+    """Construct the provider's own auth-error class."""
+    error_cls = codex.CodexAuthError if provider is codex else claude_oauth.ClaudeAuthError
+    return error_cls(code, message)
 
 
 def _finish(
+    provider: ModuleType,
     code: str | None,
     returned_state: str | None,
     verifier: str,
@@ -167,16 +211,16 @@ def _finish(
     require_state: bool,
 ) -> dict[str, Any]:
     if not code:
-        raise codex.CodexAuthError("no_code", "no authorization code found in the redirect")
-    # The loopback callback from OpenAI always carries state, so a missing or
-    # mismatched value there is forged (CSRF) and must be rejected. Manual paste
-    # is user-initiated (the user copies their own redirect), so state is only
+        raise _auth_error(provider, "no_code", "no authorization code found in the redirect")
+    # The loopback callback always carries state, so a missing or mismatched
+    # value there is forged (CSRF) and must be rejected. Manual paste is
+    # user-initiated (the user copies their own redirect), so state is only
     # validated when the pasted value includes it.
     if require_state and returned_state is None:
-        raise codex.CodexAuthError("state_mismatch", "missing state in callback; possible CSRF")
+        raise _auth_error(provider, "state_mismatch", "missing state in callback; possible CSRF")
     if returned_state is not None and returned_state != expected_state:
-        raise codex.CodexAuthError("state_mismatch", "state did not match; possible CSRF")
-    return codex.exchange_code(code, verifier)
+        raise _auth_error(provider, "state_mismatch", "state did not match; possible CSRF")
+    return provider.exchange_code(code, verifier)
 
 
 class _CallbackServer:
@@ -203,9 +247,11 @@ class _CallbackServer:
         self._httpd.server_close()
 
 
-def _try_start_callback_server() -> _CallbackServer | None:
+def _try_start_callback_server(provider: ModuleType) -> _CallbackServer | None:
     event = threading.Event()
     holder: dict[str, Any] = {}
+    callback_path = provider.CALLBACK_PATH
+    callback_port = provider.CALLBACK_PORT
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args: Any) -> None:  # silence default stderr logging
@@ -213,7 +259,7 @@ def _try_start_callback_server() -> _CallbackServer | None:
 
         def do_GET(self) -> None:
             parsed = urlparse(self.path)
-            if parsed.path != codex.CALLBACK_PATH:
+            if parsed.path != callback_path:
                 self.send_response(404)
                 self.end_headers()
                 return
@@ -230,9 +276,9 @@ def _try_start_callback_server() -> _CallbackServer | None:
             event.set()
 
     try:
-        httpd = HTTPServer(("127.0.0.1", codex.CALLBACK_PORT), Handler)
+        httpd = HTTPServer(("127.0.0.1", callback_port), Handler)
     except OSError:
-        logger.debug("could not bind callback port %d", codex.CALLBACK_PORT, exc_info=True)
+        logger.debug("could not bind callback port %d", callback_port, exc_info=True)
         return None
     return _CallbackServer(httpd, event, holder)
 
@@ -243,30 +289,57 @@ def _first(query: dict[str, list[str]], key: str) -> str | None:
 
 
 def _status(console: Console) -> int:
-    record = codex.read_record()
-    if record is None:
-        console.print("[yellow]Not signed in.[/] Run [cyan]strix auth login chatgpt[/] to sign in.")
-        return 1
     settings = load_settings()
-    console.print("[green]Signed in[/] with a ChatGPT subscription.")
-    console.print(f"  Account: [bold]{record.get('account_id')}[/]")
-    if codex.subscription_model(settings.llm.model):
-        console.print(f"  Runs use the subscription (STRIX_LLM=[bold]{settings.llm.model}[/]).")
-    else:
+    active_label = subscription.label_for(settings.llm.model)
+    signed_in = [
+        (codex, "chatgpt/gpt-5.4"),
+        (claude_oauth, "claude/claude-opus-4-5"),
+    ]
+    any_signed_in = False
+    for provider, example in signed_in:
+        record = provider.read_record()
+        if record is None:
+            continue
+        any_signed_in = True
+        label = _provider_label(provider)
+        console.print(f"[green]Signed in[/] with a {label} subscription.")
+        account_id = record.get("account_id")
+        if account_id:
+            console.print(f"  Account: [bold]{account_id}[/]")
+        if active_label == label:
+            console.print(f"  Runs use this subscription (STRIX_LLM=[bold]{settings.llm.model}[/]).")
+        else:
+            console.print(
+                f"  [yellow]Note:[/] set [cyan]STRIX_LLM[/] to e.g. [cyan]{example}[/] "
+                "to run on this subscription."
+            )
+    if not any_signed_in:
         console.print(
-            "  [yellow]Note:[/] set [cyan]STRIX_LLM[/] to e.g. [cyan]chatgpt/gpt-5.4[/] "
-            "to run on the subscription."
+            "[yellow]Not signed in.[/] Run [cyan]strix auth login chatgpt[/] or "
+            "[cyan]strix auth login claude[/] to sign in."
         )
+        return 1
     return 0
 
 
-def _logout(console: Console) -> int:
-    codex.logout()
+def _logout(console: Console, argv: list[str]) -> int:
+    # Optional provider arg: `strix auth logout claude`. No arg logs out of all.
+    name = argv[0] if argv else None
+    if name is not None:
+        provider = _resolve_provider(name)
+        if provider is None:
+            console.print(f"[red]Unknown provider:[/] {name}. Use 'chatgpt' or 'claude'.")
+            return 2
+        providers = [provider]
+    else:
+        providers = [codex, claude_oauth]
+    for provider in providers:
+        provider.logout()
     console.print("[green]Signed out.[/] Stored subscription credentials removed.")
     return 0
 
 
-def _fail(console: Console, exc: codex.CodexAuthError) -> int:
+def _fail(console: Console, exc: Exception) -> int:
     error_text = Text()
     error_text.append("SIGN-IN FAILED", style="bold red")
     error_text.append("\n\n", style="white")
@@ -284,17 +357,20 @@ def _fail(console: Console, exc: codex.CodexAuthError) -> int:
     return 1
 
 
-def _print_success(console: Console) -> None:
+def _print_success(console: Console, provider: ModuleType) -> None:
+    label = _provider_label(provider)
+    prefix = provider.SUBSCRIPTION_PREFIX  # e.g. "chatgpt/" or "claude/"
+    example = "chatgpt/gpt-5.4" if provider is codex else "claude/claude-opus-4-5"
     text = Text()
-    text.append("Signed in with your ChatGPT subscription", style="bold #22c55e")
+    text.append(f"Signed in with your {label} subscription", style="bold #22c55e")
     text.append("\n\n", style="white")
     text.append("Set ", style="white")
     text.append("STRIX_LLM", style="bold white")
     text.append(" to a ", style="white")
-    text.append("chatgpt/", style="bold cyan")
+    text.append(prefix, style="bold cyan")
     text.append(" model (e.g. ", style="white")
-    text.append("chatgpt/gpt-5.4", style="bold cyan")
-    text.append(") — runs are billed to your ChatGPT plan.", style="white")
+    text.append(example, style="bold cyan")
+    text.append(f") — runs are billed to your {label} plan.", style="white")
     text.append("\n\n", style="white")
     text.append("Run a scan as usual, e.g. ", style="white")
     text.append("strix --target https://example.com", style="bold cyan")

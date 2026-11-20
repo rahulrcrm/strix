@@ -39,7 +39,7 @@ from openai.types.responses.response_usage import ResponseUsage
 from openai.types.shared import Reasoning
 
 from strix.agents.prompt import CACHE_POINT
-from strix.config import codex
+from strix.config import claude_oauth, codex, subscription
 from strix.config.loader import load_settings
 from strix.config.tool_call_arguments import repair_input
 from strix.config.tool_call_ids import TurnCallIdRewriter, dedupe_input
@@ -78,7 +78,7 @@ def _retry_statusless_provider_errors(context: RetryPolicyContext) -> bool:
     normalized = context.normalized
     if normalized.is_abort:
         return False
-    if codex.is_content_guardrail_error(context.error):
+    if subscription.is_content_guardrail_error(context.error):
         return False
     return normalized.status_code is None
 
@@ -560,6 +560,54 @@ class _CredentialedLitellmProvider(ModelProvider):
         )
 
 
+def _build_claude_subscription_model(slug: str, _llm: LlmSettings) -> Model:
+    """Build the inference model for a ``claude/<model>`` subscription route.
+
+    SCAFFOLD — this is the one integration boundary that needs a live OAuth token
+    to settle (see ``strix/config/claude_oauth.py`` and
+    ``SCAFFOLD-claude-subscription.md``). Two implementation paths:
+
+      A. LiteLLM route (preferred, ~minimal). Reuse the SDK's ``LitellmModel`` for
+         ``anthropic/<slug>`` and inject ``claude_oauth.oauth_extra_headers()``
+         (Bearer token + ``anthropic-beta: oauth-2025-04-20``). Viable ONLY if a
+         stray ``x-api-key`` from LiteLLM's Anthropic path does not also go out
+         and get the pair rejected. Verify with a standalone litellm.completion()
+         call before wiring.
+
+      B. Native client (fallback, heavier). Drive ``claude_oauth
+         .get_subscription_client()`` (``AsyncAnthropic(auth_token=…)`` → Bearer)
+         from a hand-rolled ``Model`` subclass implementing get_response /
+         stream_response, analogous to ``_CodexResponsesModel``.
+
+    Either path may additionally need the Claude Code system-prompt preamble
+    injected in ``_split_cached_prefix`` if ``/v1/messages`` gates OAuth tokens on
+    it. Confirm with one curl first.
+
+    Starting point for path A (commented until the header question is settled):
+
+        from agents.extensions.models.litellm_model import LitellmModel
+        inner = LitellmModel(model=f"anthropic/{slug}", api_key=claude_oauth.get_valid_token())
+        return request_log.RequestLoggingModel(
+            inner, model_name=slug, provider="anthropic-oauth", base_url=None, route="litellm",
+        )
+    """
+    if claude_oauth.CLIENT_ID.startswith("VERIFY_"):
+        raise claude_oauth.ClaudeAuthError(
+            "not_configured",
+            "The claude/ subscription route is a scaffold: set a sourced OAuth "
+            "CLIENT_ID / REDIRECT_URI in strix/config/claude_oauth.py and complete "
+            "_build_claude_subscription_model in strix/config/models.py. See "
+            "SCAFFOLD-claude-subscription.md. For a working Anthropic path today, "
+            f"use STRIX_LLM=anthropic/{slug} with a metered LLM_API_KEY instead.",
+        )
+    # Credentials are configured but the inference wiring (path A or B above) is
+    # not yet implemented — fail loud rather than emit a mis-authed model.
+    raise NotImplementedError(
+        "claude/ subscription inference wiring is not implemented yet; "
+        "complete _build_claude_subscription_model (see SCAFFOLD-claude-subscription.md)."
+    )
+
+
 class StrixProvider(MultiProvider):
     """Route any non-OpenAI prefix through LiteLLM with the prefix preserved,
     so users type ``deepseek/deepseek-chat`` rather than
@@ -612,6 +660,9 @@ class StrixProvider(MultiProvider):
 
     def get_model(self, model_name: str | None) -> Model:
         llm = load_settings().llm
+        claude_slug = claude_oauth.subscription_model(model_name)
+        if claude_slug:
+            return _build_claude_subscription_model(claude_slug, llm)
         slug = codex.subscription_model(model_name)
         # The settings use 0 for no bound.
         idle_timeout = float(llm.stream_idle_timeout) or None

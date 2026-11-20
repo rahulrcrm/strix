@@ -1,4 +1,4 @@
-"""Tests for the `strix auth` CLI: subcommand routing and provider naming."""
+"""Tests for the `strix auth` CLI: subcommand routing and provider dispatch."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
-from strix.config import codex
+from strix.config import claude_oauth, codex
 from strix.interface import auth_cli
 
 
@@ -16,13 +16,19 @@ if TYPE_CHECKING:
 
 @pytest.fixture(autouse=True)
 def _tmp_store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(codex, "AUTH_PATH", tmp_path / "home" / ".strix" / "subscription-auth.json")
+    store = tmp_path / "home" / ".strix" / "subscription-auth.json"
+    # Both providers share one store; point both at the temp path.
+    monkeypatch.setattr(codex, "AUTH_PATH", store)
+    monkeypatch.setattr(claude_oauth, "AUTH_PATH", store)
 
 
-def test_login_provider_is_chatgpt() -> None:
-    assert auth_cli.LOGIN_PROVIDER == "chatgpt"
-    assert codex.PROVIDER in auth_cli._ACCEPTED_PROVIDERS
-    assert "chatgpt" in auth_cli._ACCEPTED_PROVIDERS
+def test_default_login_provider_is_chatgpt() -> None:
+    assert auth_cli.DEFAULT_LOGIN_PROVIDER == "chatgpt"
+    assert auth_cli._resolve_provider("chatgpt") is codex
+    assert auth_cli._resolve_provider("codex") is codex
+    assert auth_cli._resolve_provider("claude") is claude_oauth
+    assert auth_cli._resolve_provider("anthropic") is claude_oauth
+    assert auth_cli._resolve_provider("gemini") is None
 
 
 def test_unknown_subcommand_returns_usage_error() -> None:
@@ -51,56 +57,91 @@ def test_finish_requires_state_on_loopback(monkeypatch: pytest.MonkeyPatch) -> N
 
     # Loopback (require_state=True): missing or mismatched state is rejected.
     with pytest.raises(codex.CodexAuthError) as missing:
-        auth_cli._finish("code", None, "verifier", "expected", require_state=True)
+        auth_cli._finish(codex, "code", None, "verifier", "expected", require_state=True)
     assert missing.value.code == "state_mismatch"
     with pytest.raises(codex.CodexAuthError) as mismatch:
-        auth_cli._finish("code", "wrong", "verifier", "expected", require_state=True)
+        auth_cli._finish(codex, "code", "wrong", "verifier", "expected", require_state=True)
     assert mismatch.value.code == "state_mismatch"
 
     # Matching state proceeds to the exchange.
-    assert auth_cli._finish("code", "expected", "verifier", "expected", require_state=True) == {
-        "ok": True
-    }
+    assert auth_cli._finish(
+        codex, "code", "expected", "verifier", "expected", require_state=True
+    ) == {"ok": True}
 
 
 def test_finish_manual_paste_allows_absent_state(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(codex, "exchange_code", lambda *_: {"ok": True})
     # Manual paste (require_state=False): a bare code with no state is accepted,
     # but a present-and-wrong state is still rejected.
-    assert auth_cli._finish("code", None, "verifier", "expected", require_state=False) == {
-        "ok": True
-    }
+    assert auth_cli._finish(
+        codex, "code", None, "verifier", "expected", require_state=False
+    ) == {"ok": True}
     with pytest.raises(codex.CodexAuthError):
-        auth_cli._finish("code", "wrong", "verifier", "expected", require_state=False)
+        auth_cli._finish(codex, "code", "wrong", "verifier", "expected", require_state=False)
 
 
 def test_finish_rejects_missing_code() -> None:
     with pytest.raises(codex.CodexAuthError) as exc:
-        auth_cli._finish(None, "expected", "verifier", "expected", require_state=True)
+        auth_cli._finish(codex, None, "expected", "verifier", "expected", require_state=True)
     assert exc.value.code == "no_code"
+
+
+def test_finish_uses_claude_provider_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    # CSRF validation holds for the claude provider too, raising ITS error class.
+    with pytest.raises(claude_oauth.ClaudeAuthError) as exc:
+        auth_cli._finish(claude_oauth, "code", None, "verifier", "expected", require_state=True)
+    assert exc.value.code == "state_mismatch"
 
 
 def test_model_subcommand_removed() -> None:
     assert auth_cli.run_auth(["model", "gpt-5.5"]) == 2
 
 
-@pytest.mark.parametrize("provider", ["chatgpt", "codex", "ChatGPT"])
-def test_login_accepts_provider_aliases(provider: str, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    ("provider_name", "provider_mod"),
+    [
+        ("chatgpt", codex),
+        ("codex", codex),
+        ("ChatGPT", codex),
+        ("claude", claude_oauth),
+        ("anthropic", claude_oauth),
+    ],
+)
+def test_login_accepts_provider_aliases(
+    provider_name: str, provider_mod: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
     reached = {"flow": False}
 
     def _fake_flow(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
         reached["flow"] = True
         return {
             "type": "oauth",
-            "provider": "codex",
+            "provider": provider_mod.PROVIDER,
             "access": "a",
             "refresh": "r",
-            "account_id": "acct",
             "expires_at": 0,
         }
 
     monkeypatch.setattr(auth_cli, "_run_oauth_flow", _fake_flow)
-    monkeypatch.setattr(codex, "save_record", lambda _record: None)
+    monkeypatch.setattr(provider_mod, "save_record", lambda _record: None)
 
-    assert auth_cli.run_auth(["login", provider]) == 0
+    assert auth_cli.run_auth(["login", provider_name]) == 0
     assert reached["flow"] is True
+
+
+def test_logout_specific_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[str] = []
+    monkeypatch.setattr(codex, "logout", lambda: calls.append("codex"))
+    monkeypatch.setattr(claude_oauth, "logout", lambda: calls.append("claude"))
+
+    assert auth_cli.run_auth(["logout", "claude"]) == 0
+    assert calls == ["claude"]
+
+
+def test_logout_all_providers(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[str] = []
+    monkeypatch.setattr(codex, "logout", lambda: calls.append("codex"))
+    monkeypatch.setattr(claude_oauth, "logout", lambda: calls.append("claude"))
+
+    assert auth_cli.run_auth(["logout"]) == 0
+    assert set(calls) == {"codex", "claude"}

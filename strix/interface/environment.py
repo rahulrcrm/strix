@@ -8,7 +8,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
 
-from strix.config import IntegrationSettings, codex, load_settings
+from strix.config import IntegrationSettings, load_settings, subscription
 from strix.interface.utils import (
     check_docker_connection,
     image_exists,
@@ -39,15 +39,17 @@ def validate_environment() -> None:
 
     settings = load_settings()
 
-    if codex.subscription_model(settings.llm.model):
-        if not codex.is_authenticated():
+    sub_label = subscription.label_for(settings.llm.model)
+    if sub_label is not None:
+        if not subscription.is_authenticated_for(settings.llm.model):
             console.print(
-                f"[red]STRIX_LLM={settings.llm.model} uses your ChatGPT subscription, "
-                "but you're not signed in.[/] Run [cyan]strix auth login chatgpt[/] first."
+                f"[red]STRIX_LLM={settings.llm.model} uses your {sub_label} subscription, "
+                f"but you're not signed in.[/] Run "
+                f"[cyan]strix auth login {sub_label.lower()}[/] first."
             )
             report_error("subscription_not_signed_in")
             sys.exit(1)
-        logger.info("Environment OK (ChatGPT subscription)")
+        logger.info("Environment OK (%s subscription)", sub_label)
         return
 
     if not settings.llm.model:
