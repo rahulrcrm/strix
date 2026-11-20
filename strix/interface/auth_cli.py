@@ -161,7 +161,10 @@ def _run_oauth_flow(
     manual: bool,
 ) -> dict[str, Any]:
     """Drive the browser (or manual) OAuth flow and return a token record."""
-    server = None if manual else _try_start_callback_server(provider)
+    # Some providers (Claude Code) use a hosted callback + manual paste rather
+    # than a localhost listener; they set USES_LOOPBACK_SERVER = False.
+    uses_loopback = getattr(provider, "USES_LOOPBACK_SERVER", True)
+    server = None if (manual or not uses_loopback) else _try_start_callback_server(provider)
 
     console.print("Open this URL in your browser to authorize:")
     console.print(f"[cyan]{authorize_url}[/]")
@@ -220,6 +223,10 @@ def _finish(
         raise _auth_error(provider, "state_mismatch", "missing state in callback; possible CSRF")
     if returned_state is not None and returned_state != expected_state:
         raise _auth_error(provider, "state_mismatch", "state did not match; possible CSRF")
+    # Some providers (Claude Code) echo the locally generated state in the token
+    # exchange body; they set EXCHANGE_NEEDS_STATE = True.
+    if getattr(provider, "EXCHANGE_NEEDS_STATE", False):
+        return provider.exchange_code(code, verifier, expected_state)
     return provider.exchange_code(code, verifier)
 
 

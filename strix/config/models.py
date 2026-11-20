@@ -591,20 +591,14 @@ def _build_claude_subscription_model(slug: str, _llm: LlmSettings) -> Model:
             inner, model_name=slug, provider="anthropic-oauth", base_url=None, route="litellm",
         )
     """
-    if claude_oauth.CLIENT_ID.startswith("VERIFY_"):
-        raise claude_oauth.ClaudeAuthError(
-            "not_configured",
-            "The claude/ subscription route is a scaffold: set a sourced OAuth "
-            "CLIENT_ID / REDIRECT_URI in strix/config/claude_oauth.py and complete "
-            "_build_claude_subscription_model in strix/config/models.py. See "
-            "SCAFFOLD-claude-subscription.md. For a working Anthropic path today, "
-            f"use STRIX_LLM=anthropic/{slug} with a metered LLM_API_KEY instead.",
-        )
-    # Credentials are configured but the inference wiring (path A or B above) is
-    # not yet implemented — fail loud rather than emit a mis-authed model.
+    # OAuth sign-in (strix auth login claude) is wired; the inference call (path A
+    # or B above) still needs a live token to settle, so fail loud rather than
+    # emit a mis-authed model. See SCAFFOLD-claude-subscription.md.
     raise NotImplementedError(
-        "claude/ subscription inference wiring is not implemented yet; "
-        "complete _build_claude_subscription_model (see SCAFFOLD-claude-subscription.md)."
+        f"claude/ subscription sign-in works, but inference wiring is not finished "
+        f"(see SCAFFOLD-claude-subscription.md and _build_claude_subscription_model). "
+        f"For a working Anthropic path today, use STRIX_LLM=anthropic/{slug} with a "
+        f"metered LLM_API_KEY."
     )
 
 

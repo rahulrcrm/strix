@@ -7,32 +7,36 @@ Anthropic Messages API, plus the ``anthropic-beta: oauth-2025-04-20`` header.
 
 SCAFFOLD STATUS
 ---------------
-This module is a structural scaffold. The PKCE flow, token store, refresh guard
-and prefix helpers mirror ``codex.py`` one-for-one and are complete. Three things
-must be VERIFIED against a primary source (Claude Code's own distributed bundle
-or a maintained OSS implementation of this flow) before the path works end to
-end — they are security-critical and are intentionally NOT presented here as
-settled facts:
+The OAuth flow (login → token → refresh) is wired with values sourced from the
+Claude Code CLI bundle and a working PKCE implementation (see SOURCES below).
+Unlike codex.py's localhost loopback, Claude Code uses a MANUAL copy-paste flow:
+the redirect is a hosted callback page that displays ``code#state`` for the user
+to paste back. ``USES_LOOPBACK_SERVER = False`` makes auth_cli skip the local
+HTTP server for this provider.
 
-  1. ``CLIENT_ID`` and ``REDIRECT_URI`` — the redirect URI must match what is
-     registered server-side for this client_id exactly; you cannot pick the port
-     freely the way codex.py picked 1455. Source both, do not recall them.
-  2. Whether an OAuth-token request to ``/v1/messages`` succeeds with an
-     arbitrary system prompt, or is gated on the system prompt beginning with the
-     Claude Code identity string. If gated, the preamble must be injected where
-     system messages are assembled (``strix/config/models.py`` ``_split_cached_prefix``),
-     not here. One curl answers it.
-  3. Whether Anthropic refuses pentest-shaped content the way ChatGPT's guardrail
-     does. If so, mirror ``CodexContentGuardrailError`` (a stub class is provided
-     below) and wire detection in ``core/execution.py`` / ``models.py``.
+Two things still need a LIVE token to settle (the inference layer, not auth):
+  1. Whether a ``Bearer`` OAuth request to ``/v1/messages`` succeeds with Strix's
+     own system prompt, or is gated on a Claude Code identity preamble. If gated,
+     inject it in ``models.py`` ``_split_cached_prefix``, not here.
+  2. The ``anthropic-beta`` header required for OAuth inference. ``OAUTH_BETA``
+     below (``oauth-2025-04-20``) is the community value but appears in NONE of
+     the sourced artifacts — confirm against a live call before relying on it.
+Also: ``ClaudeContentGuardrailError`` markers are stubs (confirm a real refusal).
+
+SOURCES (2026-11, may drift — Claude Code moved console.anthropic.com →
+platform.claude.com across versions; keep the alternates below in mind):
+  - cli.js v2.0.69 extraction: client_id, authorize/token/callback hosts.
+  - platform.claude.com/docs OAuth reference: PKCE S256, redirect-URI rules.
+  - Working manual-PKCE implementation: authorize params (incl. ``code=true``),
+    form-urlencoded token body incl. ``state``, scope string.
 
 POLICY
 ------
 Driving a third-party tool with a Claude Pro/Max *subscription* OAuth token is
 outside Anthropic's consumer / Claude Code terms, the same way codex.py notes for
-OpenAI. This is for private evaluation; the user chooses this path knowingly. The
-ToS-clean alternative is ``STRIX_LLM=anthropic/claude-...`` with a metered
-``LLM_API_KEY`` (already supported upstream, no OAuth).
+OpenAI. This fork is for private, internal evaluation; the user chooses this path
+knowingly. The ToS-clean alternative is ``STRIX_LLM=anthropic/claude-...`` with a
+metered ``LLM_API_KEY`` (already supported upstream, no OAuth).
 """
 
 from __future__ import annotations
@@ -65,21 +69,40 @@ logger = logging.getLogger(__name__)
 
 PROVIDER = "claude"
 
-# --- VERIFY: source these from Claude Code's distributed bundle, do not recall ---
-# The values below are placeholders marking the shape of the flow. The redirect
-# URI in particular MUST match the client's registered value exactly.
-CLIENT_ID = "VERIFY_CLAUDE_CODE_OAUTH_CLIENT_ID"  # noqa: S105 - placeholder, not a secret
+# OAuth client of the Claude Code CLI (sourced — see module docstring SOURCES).
+# This is Claude Code's own public client id, reused so a Pro/Max subscription
+# sign-in works; it is not a secret.
+CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"  # noqa: S105 - public client id
+
+# Authorize on claude.ai for a Pro/Max *subscription* sign-in (console.anthropic
+# .com/oauth/authorize is the Console/API-billing variant of the same client).
 AUTHORIZE_URL = "https://claude.ai/oauth/authorize"
-TOKEN_URL = "https://console.anthropic.com/v1/oauth/token"  # noqa: S105 - URL, not a secret
-CALLBACK_HOST = "localhost"
-CALLBACK_PORT = 54545  # VERIFY: must match the client's registered redirect URI
-CALLBACK_PATH = "/callback"
-REDIRECT_URI = f"http://{CALLBACK_HOST}:{CALLBACK_PORT}{CALLBACK_PATH}"
-# VERIFY: exact scope string the client is registered for.
-SCOPE = "org:create_api_key user:profile user:inference"
-# --------------------------------------------------------------------------------
+
+# Token + redirect hosts moved console.anthropic.com -> platform.claude.com
+# across Claude Code versions. Newest extraction uses platform.claude.com; if a
+# token exchange 404s/401s, try the console.anthropic.com alternates below.
+TOKEN_URL = "https://platform.claude.com/v1/oauth/token"  # noqa: S105 - URL, not a secret
+# Alt (v2.0.69): "https://console.anthropic.com/v1/oauth/token"
+
+# Manual copy-paste callback: a hosted page that shows ``code#state`` to paste
+# back. MUST exactly match the redirect_uri registered for CLIENT_ID and be
+# identical in the authorize request and the token exchange.
+REDIRECT_URI = "https://platform.claude.com/oauth/code/callback"
+# Alt (v2.0.69): "https://console.anthropic.com/oauth/code/callback"
+
+# Sourced scope set for subscription inference (order matches the authorize URL).
+SCOPE = "user:inference user:profile user:sessions:claude_code user:mcp_servers"
+
+# Claude Code uses a hosted callback + manual paste, not a localhost listener.
+# auth_cli reads this to skip starting a loopback server for this provider.
+USES_LOOPBACK_SERVER = False
+# The token exchange must echo the locally-generated ``state``; auth_cli reads
+# this to pass it through ``exchange_code``.
+EXCHANGE_NEEDS_STATE = True
 
 ANTHROPIC_BASE_URL = "https://api.anthropic.com"
+# SCAFFOLD/UNVERIFIED: community value for the OAuth-inference beta header; it is
+# in none of the sourced artifacts. Confirm against a live /v1/messages call.
 OAUTH_BETA = "oauth-2025-04-20"
 
 _TOKEN_TIMEOUT = 30
@@ -203,19 +226,23 @@ def _b64url(raw: bytes) -> str:
 
 
 def generate_pkce() -> tuple[str, str]:
-    verifier = _b64url(secrets.token_bytes(64))
+    # 32 random bytes -> 43-char base64url verifier (matches Claude Code; the
+    # RFC 7636 range is 43-128 chars). challenge = base64url(SHA256(verifier)).
+    verifier = _b64url(secrets.token_bytes(32))
     challenge = _b64url(hashlib.sha256(verifier.encode("ascii")).digest())
     return verifier, challenge
 
 
 def create_state() -> str:
-    return secrets.token_hex(16)
+    return _b64url(secrets.token_bytes(32))
 
 
 def build_authorize_url(challenge: str, state: str) -> str:
+    # Param set + the ``code=true`` flag match Claude Code's own authorize URL.
     params = {
-        "response_type": "code",
+        "code": "true",
         "client_id": CLIENT_ID,
+        "response_type": "code",
         "redirect_uri": REDIRECT_URI,
         "scope": SCOPE,
         "code_challenge": challenge,
@@ -294,17 +321,20 @@ def _record_from_token_response(
     }
 
 
-def exchange_code(code: str, verifier: str) -> dict[str, Any]:
-    data = _post_form(
-        {
-            "grant_type": "authorization_code",
-            "client_id": CLIENT_ID,
-            "code": code,
-            "code_verifier": verifier,
-            "redirect_uri": REDIRECT_URI,
-        }
-    )
-    return _record_from_token_response(data)
+def exchange_code(code: str, verifier: str, state: str | None = None) -> dict[str, Any]:
+    # Claude Code splits the pasted ``code#state`` and sends only the part before
+    # ``#`` as ``code``, plus the locally generated ``state`` (passed in here).
+    # Body is form-urlencoded (JSON reportedly times out on this endpoint).
+    payload = {
+        "grant_type": "authorization_code",
+        "client_id": CLIENT_ID,
+        "code": code.split("#", 1)[0],
+        "code_verifier": verifier,
+        "redirect_uri": REDIRECT_URI,
+    }
+    if state is not None:
+        payload["state"] = state
+    return _record_from_token_response(_post_form(payload))
 
 
 def refresh_tokens(refresh_token: str) -> dict[str, Any]:

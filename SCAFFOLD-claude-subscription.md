@@ -4,10 +4,11 @@ Adds a second subscription path alongside the upstream ChatGPT (Codex) one, so
 `STRIX_LLM=claude/<model>` can drive Strix off a **Claude Pro/Max subscription**
 via OAuth instead of a metered `LLM_API_KEY`.
 
-This is a **scaffold**: the auth flow, token store, CLI, and routing are wired;
-the inference call and a few security-critical constants are intentionally left
-as verified-before-use integration points (see below). It does **not** run
-end-to-end yet.
+This is a **scaffold**: the OAuth sign-in flow, token store, CLI, and routing are
+wired with sourced constants. The **inference call** is the one remaining piece —
+it needs a live token to settle (see below). `strix auth login claude` should
+work; a scan with `STRIX_LLM=claude/<model>` raises a clear `NotImplementedError`
+at the inference boundary until that piece lands.
 
 > **Policy note.** Driving a third-party tool with a Claude Pro/Max *subscription*
 > OAuth token is outside Anthropic's consumer / Claude Code terms — the same gray
@@ -30,19 +31,30 @@ The token store `~/.strix/subscription-auth.json` is **shared** by both
 providers, keyed by `PROVIDER` (`"codex"` / `"claude"`). `logout()` only unlinks
 the file when the dict is empty, so signing out of one leaves the other intact.
 
-## Must verify before it works (needs a live token)
+## OAuth constants (sourced)
 
-1. **OAuth constants** — `CLIENT_ID`, `REDIRECT_URI` (host/port/path) and `SCOPE`
-   in `claude_oauth.py` are placeholders. `CLIENT_ID` is literally
-   `VERIFY_CLAUDE_CODE_OAUTH_CLIENT_ID`; the routing refuses to run until it's
-   replaced. The redirect URI must match the client's server-side registration
-   exactly — you cannot pick the port freely. **Source these from a primary
-   artifact (Claude Code's distributed bundle or a maintained OSS implementation
-   of this flow); do not recall them.**
+Filled in from the Claude Code CLI bundle + a working PKCE implementation (2026-11):
 
-2. **Auth header path** — OAuth needs `Authorization: Bearer <token>` +
-   `anthropic-beta: oauth-2025-04-20`, *not* `x-api-key`. Decide the model layer
-   with one standalone check:
+| Value | Setting |
+| --- | --- |
+| `CLIENT_ID` | `9d1c250a-e61b-44d9-88ed-5944d1962f5e` (Claude Code's public client) |
+| Authorize | `https://claude.ai/oauth/authorize` (Pro/Max subscription) + `code=true` |
+| Token | `https://platform.claude.com/v1/oauth/token` (alt: `console.anthropic.com`) |
+| Redirect | `https://platform.claude.com/oauth/code/callback` (manual copy-paste) |
+| Scope | `user:inference user:profile user:sessions:claude_code user:mcp_servers` |
+| Flow | manual paste (`USES_LOOPBACK_SERVER = False`), token body form-urlencoded, echoes `state` |
+
+**Version drift:** Claude Code moved `console.anthropic.com` → `platform.claude.com`
+across versions. If a token exchange 401/404s, flip `TOKEN_URL` and `REDIRECT_URI`
+to the documented `console.anthropic.com` alternates in `claude_oauth.py` (keep
+them identical to each other). The redirect URI must match the client's
+registration exactly.
+
+## Still needs a live token (inference layer)
+
+1. **Auth header path** — OAuth needs `Authorization: Bearer <token>`, *not*
+   `x-api-key`, plus (likely) the `anthropic-beta` header below. Decide the model
+   layer with one standalone check:
 
    ```bash
    python -c "import litellm; print(litellm.completion(
@@ -60,14 +72,17 @@ the file when the dict is empty, so signing out of one leaves the other intact.
      `_CodexResponsesModel`. Heavier.
 
    Both paths are sketched in `_build_claude_subscription_model` in `models.py`.
+   Note: the `anthropic-beta: oauth-2025-04-20` value is the community header for
+   OAuth inference but appears in **none** of the sourced artifacts — confirm it
+   (and whether it's even required) with the call above before wiring.
 
-3. **System-prompt gating** — confirm with one curl whether `/v1/messages`
+2. **System-prompt gating** — confirm with one curl whether `/v1/messages`
    accepts an OAuth token with an arbitrary system prompt, or requires the system
    message to begin with the Claude Code identity string. If gated, inject the
    preamble in `_split_cached_prefix` (`models.py`), **not** in the OAuth module —
    Strix sends its own large pentest system prompt.
 
-4. **Content guardrail** (second-order) — Anthropic may refuse pentest-shaped
+3. **Content guardrail** (second-order) — Anthropic may refuse pentest-shaped
    content the way ChatGPT's guardrail does. `ClaudeContentGuardrailError` and its
    markers in `claude_oauth.py` are stubs; confirm the real refusal shape against
    a live rejection, then wire detection in `core/execution.py` (mirrors codex).

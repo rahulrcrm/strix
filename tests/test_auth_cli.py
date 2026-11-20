@@ -93,6 +93,23 @@ def test_finish_uses_claude_provider_error(monkeypatch: pytest.MonkeyPatch) -> N
     assert exc.value.code == "state_mismatch"
 
 
+def test_finish_passes_state_for_claude(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Claude's token exchange echoes the locally generated state
+    # (EXCHANGE_NEEDS_STATE); codex's does not. _finish must thread it through.
+    seen: dict[str, Any] = {}
+
+    def _fake_exchange(code: str, verifier: str, state: str | None = None) -> dict[str, Any]:
+        seen["args"] = (code, verifier, state)
+        return {"ok": True}
+
+    monkeypatch.setattr(claude_oauth, "exchange_code", _fake_exchange)
+    result = auth_cli._finish(
+        claude_oauth, "code", "expected", "verifier", "expected", require_state=True
+    )
+    assert result == {"ok": True}
+    assert seen["args"] == ("code", "verifier", "expected")
+
+
 def test_model_subcommand_removed() -> None:
     assert auth_cli.run_auth(["model", "gpt-5.5"]) == 2
 
