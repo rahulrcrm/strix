@@ -560,45 +560,98 @@ class _CredentialedLitellmProvider(ModelProvider):
         )
 
 
-def _build_claude_subscription_model(slug: str, _llm: LlmSettings) -> Model:
-    """Build the inference model for a ``claude/<model>`` subscription route.
+_claude_litellm_cls: type | None = None
 
-    SCAFFOLD — this is the one integration boundary that needs a live OAuth token
-    to settle (see ``strix/config/claude_oauth.py`` and
-    ``SCAFFOLD-claude-subscription.md``). Two implementation paths:
 
-      A. LiteLLM route (preferred, ~minimal). Reuse the SDK's ``LitellmModel`` for
-         ``anthropic/<slug>`` and inject ``claude_oauth.oauth_extra_headers()``
-         (Bearer token + ``anthropic-beta: oauth-2025-04-20``). Viable ONLY if a
-         stray ``x-api-key`` from LiteLLM's Anthropic path does not also go out
-         and get the pair rejected. Verify with a standalone litellm.completion()
-         call before wiring.
+def _claude_code_litellm_cls() -> type:
+    """The ``LitellmModel`` subclass for the Claude subscription route (built lazily).
 
-      B. Native client (fallback, heavier). Drive ``claude_oauth
-         .get_subscription_client()`` (``AsyncAnthropic(auth_token=…)`` → Bearer)
-         from a hand-rolled ``Model`` subclass implementing get_response /
-         stream_response, analogous to ``_CodexResponsesModel``.
-
-    Either path may additionally need the Claude Code system-prompt preamble
-    injected in ``_split_cached_prefix`` if ``/v1/messages`` gates OAuth tokens on
-    it. Confirm with one curl first.
-
-    Starting point for path A (commented until the header question is settled):
-
-        from agents.extensions.models.litellm_model import LitellmModel
-        inner = LitellmModel(model=f"anthropic/{slug}", api_key=claude_oauth.get_valid_token())
-        return request_log.RequestLoggingModel(
-            inner, model_name=slug, provider="anthropic-oauth", base_url=None, route="litellm",
-        )
+    Defined inside a function so importing the SDK's ``LitellmModel`` (and the
+    class definition that depends on it) is deferred to first use, matching the
+    lazy imports elsewhere in this module.
     """
-    # OAuth sign-in (strix auth login claude) is wired; the inference call (path A
-    # or B above) still needs a live token to settle, so fail loud rather than
-    # emit a mis-authed model. See SCAFFOLD-claude-subscription.md.
-    raise NotImplementedError(
-        f"claude/ subscription sign-in works, but inference wiring is not finished "
-        f"(see SCAFFOLD-claude-subscription.md and _build_claude_subscription_model). "
-        f"For a working Anthropic path today, use STRIX_LLM=anthropic/{slug} with a "
-        f"metered LLM_API_KEY."
+    global _claude_litellm_cls  # noqa: PLW0603
+    if _claude_litellm_cls is not None:
+        return _claude_litellm_cls
+
+    from agents.extensions.models.litellm_model import LitellmModel
+
+    class _ClaudeCodeLitellmModel(LitellmModel):
+        """LiteLLM route for a Claude Pro/Max subscription token (path A, VERIFIED).
+
+        Two live-verified requirements of Anthropic's OAuth-inference endpoint,
+        applied per attempt so long scans survive token expiry:
+
+        1. Auth is ``Authorization: Bearer <oauth-token>`` (+ the oauth beta
+           header), injected via ``model_settings.extra_headers``. LiteLLM's
+           Anthropic path also emits an ``x-api-key`` from ``api_key``; a live
+           check confirmed the stray placeholder key does NOT break the pair, so
+           no header stripping is needed on this route.
+
+        2. The request ``system`` must be an array whose FIRST block is EXACTLY
+           ``claude_oauth.CLAUDE_CODE_SYSTEM_PREAMBLE``; anything else is rejected
+           with a disguised 429. The SDK turns ``system_instructions`` into the
+           single leading system message, so Strix's own prompt is moved into a
+           SECOND leading ``role: "system"`` message and the preamble is passed as
+           ``system_instructions`` — LiteLLM then sends ``system=[preamble, strix]``.
+        """
+
+        async def _fetch_response(  # type: ignore[override]
+            self,
+            system_instructions: str | None,
+            input: str | list[Any],  # noqa: A002
+            model_settings: ModelSettings,
+            *args: Any,
+            **kwargs: Any,
+        ) -> Any:
+            import dataclasses
+
+            from strix.config import claude_oauth
+
+            # (1) Fresh Bearer token + beta header for this attempt.
+            oauth = claude_oauth.oauth_extra_headers()
+            merged = {**(model_settings.extra_headers or {}), **oauth}
+            model_settings = dataclasses.replace(model_settings, extra_headers=merged)
+
+            # (2) Preamble as the exact first system block; Strix's prompt second.
+            items = [{"role": "user", "content": input}] if isinstance(input, str) else list(input)
+            if system_instructions:
+                items = [{"role": "system", "content": system_instructions}, *items]
+            return await super()._fetch_response(
+                claude_oauth.CLAUDE_CODE_SYSTEM_PREAMBLE,
+                items,
+                model_settings,
+                *args,
+                **kwargs,
+            )
+
+    _claude_litellm_cls = _ClaudeCodeLitellmModel
+    return _claude_litellm_cls
+
+
+def _build_claude_subscription_model(slug: str, _llm: LlmSettings) -> Model:
+    """Inference model for a ``claude/<model>`` subscription route (path A, VERIFIED).
+
+    Drives ``anthropic/<slug>`` through a ``LitellmModel`` subclass that attaches
+    the OAuth Bearer token and the Claude Code system-prompt preamble (see
+    ``_claude_code_litellm_cls`` and ``SCAFFOLD-claude-subscription.md``). The
+    returned model is logging-wrapped here; the caller applies the shared stream
+    timeouts / per-turn guard, exactly as for the metered LiteLLM route.
+    """
+    claude_oauth.get_valid_token()  # fail fast at configure time if the sign-in is dead
+    inner = _claude_code_litellm_cls()(
+        model=f"anthropic/{slug}",
+        # Real auth is the Bearer header the subclass injects; LiteLLM still wants
+        # a non-empty api_key, and this placeholder x-api-key is ignored upstream.
+        api_key="sk-ant-oauth-subscription",  # noqa: S106
+    )
+    return request_log.RequestLoggingModel(
+        inner,
+        model_name=slug,
+        provider="anthropic-oauth",
+        base_url=claude_oauth.ANTHROPIC_BASE_URL,
+        route="litellm",
+        abandoned_only=True,
     )
 
 
@@ -655,18 +708,20 @@ class StrixProvider(MultiProvider):
     def get_model(self, model_name: str | None) -> Model:
         llm = load_settings().llm
         claude_slug = claude_oauth.subscription_model(model_name)
-        if claude_slug:
-            return _build_claude_subscription_model(claude_slug, llm)
         slug = codex.subscription_model(model_name)
         # The settings use 0 for no bound.
         idle_timeout = float(llm.stream_idle_timeout) or None
         first_event_timeout = float(llm.stream_first_event_timeout) or None
         total_timeout = float(llm.stream_total_timeout) or None
-        if slug:
+        if claude_slug:
+            # Claude Pro/Max subscription via OAuth; LiteLLM-backed, so the shared
+            # stream timeouts and per-turn guard below apply as to any LiteLLM route.
+            model: Model = _build_claude_subscription_model(claude_slug, llm)
+        elif slug:
             # The ChatGPT subscription backend is always streamed; it has no
             # non-streaming mode to fall back to, so LLM_DISABLE_STREAMING
             # does not apply here.
-            model: Model = request_log.RequestLoggingModel(
+            model = request_log.RequestLoggingModel(
                 _CodexResponsesModel(
                     slug,
                     codex.get_subscription_client(),

@@ -4,11 +4,12 @@ Adds a second subscription path alongside the upstream ChatGPT (Codex) one, so
 `STRIX_LLM=claude/<model>` can drive Strix off a **Claude Pro/Max subscription**
 via OAuth instead of a metered `LLM_API_KEY`.
 
-This is a **scaffold**: the OAuth sign-in flow, token store, CLI, and routing are
-wired with sourced constants. The **inference call** is the one remaining piece —
-it needs a live token to settle (see below). `strix auth login claude` should
-work; a scan with `STRIX_LLM=claude/<model>` raises a clear `NotImplementedError`
-at the inference boundary until that piece lands.
+**Status (2026-11): working end to end.** The OAuth sign-in, token store, CLI,
+routing, **and inference** are all wired and verified against a live subscription
+token. `strix auth login claude` signs in; `STRIX_LLM=claude/<model> strix -t …`
+runs a real scan driven by the subscription. An Agents-SDK integration test
+returns a completion billed to the Claude plan; see "Inference layer" below for
+the live findings that settled the implementation.
 
 > **Policy note.** Driving a third-party tool with a Claude Pro/Max *subscription*
 > OAuth token is outside Anthropic's consumer / Claude Code terms — the same gray
@@ -22,7 +23,7 @@ at the inference boundary until that piece lands.
 | --- | --- |
 | `strix/config/claude_oauth.py` | **New.** OAuth 2.0 + PKCE, token store, refresh guard, Anthropic client, `claude/` prefix helpers. Mirrors `codex.py`. |
 | `strix/config/subscription.py` | **New.** Dispatcher mapping a `STRIX_LLM` prefix → the owning provider module; one seam the rest of the code queries (`auth_mode`, `label_for`, `is_authenticated_for`, `is_content_guardrail_error`). |
-| `strix/config/models.py` | Route `claude/<model>` in `get_model`; guardrail checks go through the dispatcher. `_build_claude_subscription_model` is the inference boundary. |
+| `strix/config/models.py` | Route `claude/<model>` in `get_model`; guardrail checks go through the dispatcher. `_ClaudeCodeLitellmModel` + `_build_claude_subscription_model` are the inference layer (Bearer auth + system-block gate). |
 | `strix/interface/auth_cli.py` | `strix auth login claude` / `status` / `logout claude`. Flow generalized to dispatch on the provider module. |
 | `strix/interface/environment.py` | Preflight gate generalized: a `claude/` model requires a Claude sign-in, not an `LLM_API_KEY`. |
 | `tests/test_auth_cli.py` | Updated to the multi-provider API + Claude coverage. |
@@ -43,6 +44,7 @@ Filled in from the Claude Code CLI bundle + a working PKCE implementation (2026-
 | Redirect | `https://platform.claude.com/oauth/code/callback` (manual copy-paste) |
 | Scope | `user:inference user:profile user:sessions:claude_code user:mcp_servers` |
 | Flow | manual paste (`USES_LOOPBACK_SERVER = False`), token body form-urlencoded, echoes `state` |
+| Beta header | `anthropic-beta: oauth-2025-04-20` — VERIFIED; the call also works without it, kept to match real Claude Code |
 
 **Version drift:** Claude Code moved `console.anthropic.com` → `platform.claude.com`
 across versions. If a token exchange 401/404s, flip `TOKEN_URL` and `REDIRECT_URI`
@@ -50,42 +52,45 @@ to the documented `console.anthropic.com` alternates in `claude_oauth.py` (keep
 them identical to each other). The redirect URI must match the client's
 registration exactly.
 
-## Still needs a live token (inference layer)
+## Inference layer (IMPLEMENTED + VERIFIED, 2026-11)
 
-1. **Auth header path** — OAuth needs `Authorization: Bearer <token>`, *not*
-   `x-api-key`, plus (likely) the `anthropic-beta` header below. Decide the model
-   layer with one standalone check:
+Settled against a live subscription token via `/v1/messages` probes. Implemented
+in `models.py` as `_ClaudeCodeLitellmModel` (a `LitellmModel` subclass) + routing
+through the shared stream-timeout / per-turn guard.
 
-   ```bash
-   python -c "import litellm; print(litellm.completion(
-     model='anthropic/claude-<model>',
-     messages=[{'role':'user','content':'hi'}],
-     extra_headers={'authorization':'Bearer <token>','anthropic-beta':'oauth-2025-04-20'},
-     max_tokens=16))"
-   ```
+1. **Auth → path A (LiteLLM).** `Authorization: Bearer <token>` is accepted.
+   LiteLLM's Anthropic path also emits an `x-api-key` from `api_key`; a live check
+   confirmed a **placeholder** `x-api-key` alongside the Bearer header does **not**
+   get the request rejected — so no header stripping and no native-client path B
+   is needed. The subclass injects `claude_oauth.oauth_extra_headers()` (fresh
+   token per attempt, so long scans survive expiry) via `model_settings.extra_headers`.
 
-   - If LiteLLM does **not** also emit a conflicting `x-api-key` → **path A**:
-     reuse `LitellmModel` and inject `claude_oauth.oauth_extra_headers()`. ~minimal.
-   - If it does and Anthropic rejects the pair → **path B**: drive
-     `claude_oauth.get_subscription_client()` (`AsyncAnthropic(auth_token=…)`
-     sends Bearer natively) from a hand-rolled `Model` subclass, analogous to
-     `_CodexResponsesModel`. Heavier.
+2. **System-prompt gate — the load-bearing finding.** The OAuth token is accepted
+   **only** when the request `system` is an **array whose FIRST block is EXACTLY**
+   `claude_oauth.CLAUDE_CODE_SYSTEM_PREAMBLE`
+   (`"You are Claude Code, Anthropic's official CLI for Claude."`). Any other first
+   block — a different prompt, or the preamble with *anything* appended **in the
+   same block** — is rejected with a **disguised `HTTP 429 rate_limit_error`**
+   (not a 401/403, and not real throttling: a known-good control succeeds between
+   two such rejections). Additional system content is fine in **later** blocks.
 
-   Both paths are sketched in `_build_claude_subscription_model` in `models.py`.
-   Note: the `anthropic-beta: oauth-2025-04-20` value is the community header for
-   OAuth inference but appears in **none** of the sourced artifacts — confirm it
-   (and whether it's even required) with the call above before wiring.
+   So `_ClaudeCodeLitellmModel._fetch_response` moves Strix's own system prompt
+   into a *second* leading `role:"system"` message and passes the preamble as
+   `system_instructions`. LiteLLM's `translate_system_message` emits one Anthropic
+   system block per leading system message (`split_leading_system_run`), yielding
+   `system=[preamble, strix-prompt]`. This is done in the model, **not** in
+   `_split_cached_prefix`.
 
-2. **System-prompt gating** — confirm with one curl whether `/v1/messages`
-   accepts an OAuth token with an arbitrary system prompt, or requires the system
-   message to begin with the Claude Code identity string. If gated, inject the
-   preamble in `_split_cached_prefix` (`models.py`), **not** in the OAuth module —
-   Strix sends its own large pentest system prompt.
+   > Prompt caching is currently **not** applied on this route (the CACHE_POINT /
+   > `cache_control` split is bypassed). Correctness first; re-adding cache blocks
+   > behind the preamble is a follow-up to cut subscription token use.
 
-3. **Content guardrail** (second-order) — Anthropic may refuse pentest-shaped
-   content the way ChatGPT's guardrail does. `ClaudeContentGuardrailError` and its
-   markers in `claude_oauth.py` are stubs; confirm the real refusal shape against
-   a live rejection, then wire detection in `core/execution.py` (mirrors codex).
+3. **Content guardrail** (still a stub) — the pentest system prompt used in the
+   integration test was accepted, but a full autonomous scan may still draw a
+   content refusal the way ChatGPT's guardrail can. `ClaudeContentGuardrailError`
+   and its markers in `claude_oauth.py` remain stubs; confirm the real refusal
+   shape against a live rejection, then wire detection in `core/execution.py`
+   (mirrors codex).
 
 ## Remaining seams (reporting/telemetry — not blocking)
 
@@ -100,12 +105,19 @@ unmetered. Enumerate them with:
 grep -rn "codex\.\|subscription\|auth_mode" strix --include="*.py"
 ```
 
-## Run the tests
+## Run it
 
-Not run in the scaffolding environment (deps weren't installable there). Run:
+`uv` wasn't available in the build environment, so a plain venv works (Python
+3.12+; verified on 3.14):
 
 ```bash
-make dev-install
-uv run pytest tests/test_auth_cli.py tests/test_models.py tests/test_usage_subscription.py
-make check-all
+python3 -m venv .venv && .venv/bin/pip install -e . pytest pytest-asyncio
+.venv/bin/strix auth login claude          # one-time OAuth sign-in (manual paste)
+STRIX_LLM=claude/claude-sonnet-4-5 .venv/bin/strix -n -t https://example.com --scan-mode quick --max-turns 40
+```
+
+Tests (passing 2026-11: auth_cli 18, models + codex 69):
+
+```bash
+.venv/bin/python -m pytest tests/test_auth_cli.py tests/test_models.py tests/test_codex_auth.py tests/test_codex_streaming.py -q
 ```

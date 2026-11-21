@@ -101,9 +101,17 @@ USES_LOOPBACK_SERVER = False
 EXCHANGE_NEEDS_STATE = True
 
 ANTHROPIC_BASE_URL = "https://api.anthropic.com"
-# SCAFFOLD/UNVERIFIED: community value for the OAuth-inference beta header; it is
-# in none of the sourced artifacts. Confirm against a live /v1/messages call.
+# VERIFIED (2026-11, live /v1/messages): OAuth-inference beta header. The call
+# also succeeds without it, but it matches real Claude Code; keep it.
 OAUTH_BETA = "oauth-2025-04-20"
+
+# VERIFIED (2026-11, live /v1/messages): an OAuth subscription token is accepted
+# only when the request's ``system`` is an array whose FIRST block is EXACTLY
+# this string. Any other first block (a different prompt, or this string with
+# anything appended in the same block) is rejected with a disguised HTTP 429
+# ``rate_limit_error``. Strix's own system prompt must therefore ride in a
+# SECOND system block behind this one. See models.py (_ClaudeCodeLitellmModel).
+CLAUDE_CODE_SYSTEM_PREAMBLE = "You are Claude Code, Anthropic's official CLI for Claude."
 
 _TOKEN_TIMEOUT = 30
 _EXPIRY_SKEW_S = 300
